@@ -18,7 +18,7 @@ Use it to automate scripts that drive dialog-based configuration (e.g. Debian `d
 ## Installation
 
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/StevenVanAcker/whiptail-replay/main/install.sh)"
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/StevenVanAcker/whiptail-replay/master/install.sh)"
 ```
 
 This downloads `whiptail-replay` from GitHub and installs it to `/usr/local/bin/whiptail`, which shadows `/usr/bin/whiptail` on most Linux distributions (because `/usr/local/bin` comes first in `PATH`).
@@ -26,7 +26,7 @@ This downloads `whiptail-replay` from GitHub and installs it to `/usr/local/bin/
 To install to a custom location:
 
 ```bash
-sudo INSTALL_DIR=/opt/bin bash -c "$(curl -fsSL https://raw.githubusercontent.com/StevenVanAcker/whiptail-replay/main/install.sh)"
+sudo INSTALL_DIR=/opt/bin bash -c "$(curl -fsSL https://raw.githubusercontent.com/StevenVanAcker/whiptail-replay/master/install.sh)"
 ```
 
 ---

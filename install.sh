@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # whiptail-replay installer
-# Usage: bash -c "$(curl -fsSL https://raw.githubusercontent.com/StevenVanAcker/whiptail-replay/main/install.sh)"
+# Usage: bash -c "$(curl -fsSL https://raw.githubusercontent.com/StevenVanAcker/whiptail-replay/master/install.sh)"
 
 set -euo pipefail
 
-GITHUB_RAW="https://raw.githubusercontent.com/StevenVanAcker/whiptail-replay/main"
+GITHUB_RAW="https://raw.githubusercontent.com/StevenVanAcker/whiptail-replay/master"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 WRAPPER="$INSTALL_DIR/whiptail"
 
