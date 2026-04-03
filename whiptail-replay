@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+"""
+whiptail-replay: A drop-in replacement for whiptail that can record and replay answers.
+
+Environment variables:
+  WHIPTAILREPLAYFILE     Path to the JSON config file (required)
+  WHIPTAILRECORD         If set, run in record mode using the real whiptail
+  WHIPTAILPATH           Path to the real whiptail binary (default: /usr/bin/whiptail)
+  WHIPTAILNORMALIZE      If set, strip --backtitle, --fb, and geometry (height/width)
+                         from args before matching
+  WHIPTAILSEQUENCE       If set, replay entries in order rather than by argument match
+  WHIPTAILREPLAYMISSING  Set to "passthrough" to call the real whiptail when no entry
+                         matches (instead of failing)
+  WHIPTAILDEBUG          If set, write debug info to stderr
+"""
+
+import fcntl
+import fnmatch
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+
+REPLAY_FILE = os.environ.get("WHIPTAILREPLAYFILE", "")
+RECORD_MODE = "WHIPTAILRECORD" in os.environ
+WHIPTAIL_PATH = os.environ.get("WHIPTAILPATH", "/usr/bin/whiptail")
+NORMALIZE = "WHIPTAILNORMALIZE" in os.environ
+SEQUENCE_MODE = "WHIPTAILSEQUENCE" in os.environ
+MISSING_POLICY = os.environ.get("WHIPTAILREPLAYMISSING", "")
+DEBUG = "WHIPTAILDEBUG" in os.environ
+
+# whiptail dialog-type flags — used to locate geometry args when normalizing
+_DIALOG_TYPES = {
+    "--yesno", "--msgbox", "--infobox", "--inputbox", "--passwordbox",
+    "--textbox", "--menu", "--checklist", "--radiolist", "--gauge",
+    "--calendar", "--timebox",
+}
+
+# Options stripped when WHIPTAILNORMALIZE is set
+_STRIP_VALUE_OPTS = {"--backtitle"}   # take one value argument
+_STRIP_FLAG_OPTS = {"--fb"}           # bare flags
+
+
+# ---------------------------------------------------------------------------
+# Debug
+# ---------------------------------------------------------------------------
+
+def debug(msg):
+    if DEBUG:
+        sys.stderr.write(f"whiptail-replay[debug]: {msg}\n")
+
+
+# ---------------------------------------------------------------------------
+# Argument normalization
+# ---------------------------------------------------------------------------
+
+def normalize_args(args):
+    """
+    Normalize an argument list for matching.
+
+    When WHIPTAILNORMALIZE is set:
+      - strips --backtitle <value> and --fb (cosmetic, vary without affecting
+        dialog semantics)
+      - strips the height and width positional arguments that follow each
+        dialog-type flag and its text argument
+    Without WHIPTAILNORMALIZE the list is returned unchanged.
+    """
+    if not NORMALIZE:
+        return args
+
+    # Pass 1: strip named cosmetic options
+    result = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in _STRIP_VALUE_OPTS:
+            i += 2  # skip option + its value
+        elif a in _STRIP_FLAG_OPTS:
+            i += 1  # skip bare flag
+        else:
+            result.append(a)
+            i += 1
+
+    # Pass 2: strip height + width positional args
+    # Pattern: [options...] --<dialogtype> <text> <height> <width> [rest...]
+    out = []
+    j = 0
+    while j < len(result):
+        tok = result[j]
+        if tok in _DIALOG_TYPES:
+            out.append(tok)   # dialog type
+            j += 1
+            if j < len(result):
+                out.append(result[j])  # text
+                j += 1
+            # skip up to two numeric args (height, width)
+            skipped = 0
+            while skipped < 2 and j < len(result) and result[j].lstrip("-").isdigit():
+                j += 1
+                skipped += 1
+        else:
+            out.append(tok)
+            j += 1
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Matching
+# ---------------------------------------------------------------------------
+
+def args_match(pattern_args, actual_args):
+    """
+    Return True if actual_args matches pattern_args.
+    Each element of pattern_args may contain fnmatch-style wildcards (*  ?  []).
+    """
+    if len(pattern_args) != len(actual_args):
+        return False
+    return all(fnmatch.fnmatchcase(a, p) for p, a in zip(pattern_args, actual_args))
+
+
+def find_entry(config, norm_args):
+    """Find the first config entry whose normalized args match norm_args."""
+    for entry in config:
+        pattern = normalize_args(entry.get("args", []))
+        if args_match(pattern, norm_args):
+            return entry
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Config I/O with locking and atomic writes
+# ---------------------------------------------------------------------------
+
+def load_config(path):
+    if not os.path.exists(path):
+        return []
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def save_config(path, config):
+    """Write config atomically: write to a temp file, then rename into place."""
+    dir_ = os.path.dirname(os.path.abspath(path))
+    with tempfile.NamedTemporaryFile("w", dir=dir_, delete=False, suffix=".tmp") as f:
+        json.dump(config, f, indent=2)
+        f.write("\n")
+        tmppath = f.name
+    os.replace(tmppath, path)
+
+
+class _ConfigLock:
+    """
+    Exclusive advisory lock for the config file.
+    Uses a companion .lock file so the config itself is never truncated by locking.
+    """
+    def __init__(self, path):
+        self._lockpath = path + ".lock"
+        self._fh = None
+
+    def __enter__(self):
+        self._fh = open(self._lockpath, "w")
+        fcntl.flock(self._fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *_):
+        fcntl.flock(self._fh, fcntl.LOCK_UN)
+        self._fh.close()
+
+
+# ---------------------------------------------------------------------------
+# Sequence state
+# ---------------------------------------------------------------------------
+
+def _seq_path():
+    return REPLAY_FILE + ".seq"
+
+
+def _read_seq():
+    try:
+        with open(_seq_path()) as f:
+            return int(f.read().strip())
+    except (FileNotFoundError, ValueError):
+        return 0
+
+
+def _write_seq(idx):
+    dir_ = os.path.dirname(os.path.abspath(_seq_path()))
+    with tempfile.NamedTemporaryFile("w", dir=dir_, delete=False, suffix=".tmp") as f:
+        f.write(str(idx) + "\n")
+        tmppath = f.name
+    os.replace(tmppath, _seq_path())
+
+
+# ---------------------------------------------------------------------------
+# Real whiptail
+# ---------------------------------------------------------------------------
+
+def run_real_whiptail(args):
+    """
+    Run the real whiptail binary, capture stderr and exit code.
+    whiptail draws its dialog to /dev/tty and writes the user's selection to
+    stderr, so we capture stderr while letting stdin/stdout/tty pass through.
+    """
+    with tempfile.TemporaryFile() as stderr_buf:
+        proc = subprocess.run(
+            [WHIPTAIL_PATH] + args,
+            stdin=sys.stdin,
+            stdout=sys.stdout,
+            stderr=stderr_buf,
+        )
+        stderr_buf.seek(0)
+        captured_stderr = stderr_buf.read().decode("utf-8", errors="replace")
+    return captured_stderr, proc.returncode
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: --list
+# ---------------------------------------------------------------------------
+
+def cmd_list():
+    if not REPLAY_FILE:
+        sys.stderr.write("whiptail-replay: WHIPTAILREPLAYFILE is not set\n")
+        sys.exit(1)
+    config = load_config(REPLAY_FILE)
+    if not config:
+        print("(no entries)")
+        return
+    width = max(len(" ".join(e.get("args", []))) for e in config)
+    width = min(width, 80)
+    print(f"{'#':>4}  {'exit':>4}  {'answer':<20}  args")
+    print("-" * max(60, width + 34))
+    for i, entry in enumerate(config):
+        args_str = " ".join(repr(a) for a in entry.get("args", []))
+        answer = repr(entry.get("stderr", ""))
+        exitcode = entry.get("exitcode", 0)
+        print(f"{i:>4}  {exitcode:>4}  {answer:<20}  {args_str}")
+
+
+# ---------------------------------------------------------------------------
+# Replay
+# ---------------------------------------------------------------------------
+
+def replay(args):
+    if not REPLAY_FILE:
+        sys.stderr.write("whiptail-replay: WHIPTAILREPLAYFILE is not set\n")
+        sys.exit(1)
+
+    norm = normalize_args(args)
+    debug(f"replay  raw={args}")
+    debug(f"replay  norm={norm}")
+
+    with _ConfigLock(REPLAY_FILE):
+        config = load_config(REPLAY_FILE)
+
+        if SEQUENCE_MODE:
+            idx = _read_seq()
+            if idx >= len(config):
+                sys.stderr.write(
+                    f"whiptail-replay: sequence exhausted"
+                    f" (index {idx}, only {len(config)} entries)\n"
+                )
+                sys.exit(1)
+            entry = config[idx]
+            debug(f"sequence: consuming entry[{idx}] args={entry.get('args')}")
+            _write_seq(idx + 1)
+        else:
+            entry = find_entry(config, norm)
+            if entry is None:
+                debug(f"no match for norm={norm}")
+                if MISSING_POLICY == "passthrough":
+                    debug("passthrough: delegating to real whiptail")
+                    # Release lock before blocking on user input
+                    pass  # lock is released by context manager on exit below
+
+    # --- outside the lock ---
+
+    if not SEQUENCE_MODE and entry is None:
+        if MISSING_POLICY == "passthrough":
+            captured_stderr, exitcode = run_real_whiptail(args)
+            if captured_stderr:
+                sys.stderr.write(captured_stderr)
+                sys.stderr.flush()
+            sys.exit(exitcode)
+        sys.stderr.write(
+            f"whiptail-replay: no replay entry found for args: {args}\n"
+        )
+        sys.exit(1)
+
+    debug(f"replaying: stderr={entry.get('stderr')!r}  exit={entry.get('exitcode', 0)}")
+
+    stderr = entry.get("stderr", "")
+    exitcode = entry.get("exitcode", 0)
+
+    if stderr:
+        sys.stderr.write(stderr)
+        sys.stderr.flush()
+
+    sys.exit(exitcode)
+
+
+# ---------------------------------------------------------------------------
+# Record
+# ---------------------------------------------------------------------------
+
+def record(args):
+    if not REPLAY_FILE:
+        sys.stderr.write("whiptail-replay: WHIPTAILREPLAYFILE is not set\n")
+        sys.exit(1)
+
+    norm = normalize_args(args)
+    debug(f"record  raw={args}")
+    debug(f"record  norm={norm}")
+
+    # Run real whiptail outside the lock so user interaction is not blocked
+    captured_stderr, exitcode = run_real_whiptail(args)
+
+    with _ConfigLock(REPLAY_FILE):
+        config = load_config(REPLAY_FILE)
+        existing = find_entry(config, norm)
+        if existing is not None:
+            debug(f"updating existing entry: {existing.get('args')}")
+            existing["stderr"] = captured_stderr
+            existing["exitcode"] = exitcode
+        else:
+            debug(f"appending new entry for args={args}")
+            config.append({"args": args, "stderr": captured_stderr, "exitcode": exitcode})
+        save_config(REPLAY_FILE, config)
+
+    if captured_stderr:
+        sys.stderr.write(captured_stderr)
+        sys.stderr.flush()
+
+    sys.exit(exitcode)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    args = sys.argv[1:]
+
+    if args and args[0] == "--list":
+        cmd_list()
+        return
+
+    if RECORD_MODE:
+        record(args)
+    else:
+        replay(args)
+
+
+if __name__ == "__main__":
+    main()
